@@ -10,35 +10,34 @@ from einops import rearrange, repeat
 
 
 @torch.compile
-def compression(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    block_size: int
-) -> torch.Tensor:
+def compression(k: torch.Tensor, v: torch.Tensor, block_size: int) -> torch.Tensor:
     # Currently, we set mean pooling as our basic compression function.
     B, T, H = k.shape[:3]
-    num_block = math.ceil(T / block_size)
-    if k.shape[1] % block_size != 0:
+    num_block = math.ceil(T / block_size)  # 计算block 数目
+    if k.shape[1] % block_size != 0:  # pad不完整的block
         k = F.pad(k, (0, 0, 0, 0, 0, num_block * block_size - T))
         v = F.pad(v, (0, 0, 0, 0, 0, num_block * block_size - T))
-    k_cmp = k.view(B, num_block, block_size, H, -1).mean(dim=2)
+    k_cmp = k.view(B, num_block, block_size, H, -1).mean(dim=2)  # 进行 mean pooling
     v_cmp = v.view(B, num_block, block_size, H, -1).mean(dim=2)
     return k_cmp, v_cmp
 
 
+# 主要负责基于压缩注意力选择的重要block，进一步进行selected kv-block内部的选择注意力，以及实现sliding window注意力，返回gate 加权后的两种注意力结果。
 def naive_nsa(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g_slc: torch.Tensor,
-    g_swa: torch.Tensor,
-    block_indices: torch.LongTensor,
-    block_counts: Optional[Union[torch.LongTensor, int]] = None,
-    block_size: int = 64,
-    window_size: int = 0,
-    scale: Optional[float] = None,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    head_first: bool = False
+    q: torch.Tensor,  # 查询向量 [B, T, HQ, K] 或 [B, HQ, T, K]
+    k: torch.Tensor,  # 键向量 [B, T, H, K] 或 [B, H, T, K]
+    v: torch.Tensor,  # 值向量 [B, T, H, V] 或 [B, H, T, V]
+    g_slc: torch.Tensor,  # 选择注意力的gate分数 [B, T, H] 或 [B, H, T]
+    g_swa: torch.Tensor,  # 滑动窗口注意力的gate分数 [B, T, H] 或 [B, H, T]
+    block_indices: torch.LongTensor,  # 块索引 [B, T, Nb]，其中Nb是每个位置选择的块数
+    block_counts: Optional[
+        Union[torch.LongTensor, int]
+    ] = None,  # 块数量 [B, T, H] 或标量
+    block_size: int = 64,  # 块大小
+    window_size: int = 0,  # 滑动窗口大小（0表示不启用）
+    scale: Optional[float] = None,  # 缩放因子，通常是1/sqrt(d_k)
+    cu_seqlens: Optional[torch.LongTensor] = None,  # 变长序列的累积长度
+    head_first: bool = False,  # 输入格式是否为head-first
 ) -> torch.Tensor:
     r"""
     Args:
@@ -83,133 +82,234 @@ def naive_nsa(
     if cu_seqlens is not None:
         assert q.shape[0] == 1, "batch size must be 1 when cu_seqlens are provided"
         if head_first:
-            raise RuntimeError("Sequences with variable lengths are not supported for head-first mode")
+            raise RuntimeError(
+                "Sequences with variable lengths are not supported for head-first mode"
+            )
+
+    # 格式处理（输入如果是head-first，统一转换为time-first，方便统一处理）
     if head_first:
-        q, k, v, block_indices = map(lambda x: rearrange(x, 'b h t d -> b t h d'), (q, k, v, block_indices))
-        g_slc, g_swa = map(lambda x: rearrange(x, 'b h t -> b t h'), (g_slc, g_swa))
+        q, k, v, block_indices = map(
+            lambda x: rearrange(x, "b h t d -> b t h d"), (q, k, v, block_indices)
+        )
+        g_slc, g_swa = map(lambda x: rearrange(x, "b h t -> b t h"), (g_slc, g_swa))
         if isinstance(block_counts, torch.Tensor):
-            block_counts = rearrange(block_counts, 'b h t -> b t h')
+            block_counts = rearrange(block_counts, "b h t -> b t h")
 
     dtype = q.dtype
     G = q.shape[2] // k.shape[2]
     BS = block_size
     S = block_indices.shape[-1]
-    k, v, block_indices = (repeat(x, 'b t h d -> b t (h g) d', g=G) for x in (k, v, block_indices))
+    k, v, block_indices = (
+        repeat(x, "b t h d -> b t (h g) d", g=G) for x in (k, v, block_indices)
+    )
     if isinstance(block_counts, torch.Tensor):
-        block_counts = repeat(block_counts, 'b t h -> b t (h g)', g=G)
-    c = torch.arange(S).repeat_interleave(BS).unsqueeze(1).expand(-1, q.shape[2]).to(q.device)
+        block_counts = repeat(block_counts, "b t h -> b t (h g)", g=G)
+    c = (
+        torch.arange(S)
+        .repeat_interleave(BS)
+        .unsqueeze(1)
+        .expand(-1, q.shape[2])
+        .to(q.device)
+    )
     q, k, v = map(lambda x: x.float(), (q, k, v))
 
-    o_slc = torch.zeros_like(v)
-    o_swa = torch.zeros_like(v) if window_size > 0 else None
+    # 初始化
+    o_slc = torch.zeros_like(v)  # 选择注意力的输出
+    o_swa = (
+        torch.zeros_like(v) if window_size > 0 else None
+    )  # 滑动窗口注意力的输出（如果启用）
     varlen = True
-    if cu_seqlens is None:
+
+    if cu_seqlens is None:  # 固定序列也生成cu_seqlens，方便统一序列处理的逻辑
         varlen = False
         B, T = q.shape[:2]
-        cu_seqlens = torch.cat([block_indices.new_tensor(range(0, B*T, T)), block_indices.new_tensor([B*T])])
+        cu_seqlens = torch.cat([
+            block_indices.new_tensor(range(0, B * T, T)),
+            block_indices.new_tensor([B * T]),
+        ])
 
+    # 循环处理当前批次内的每个序列
     for i in range(len(cu_seqlens) - 1):
+        # 获取当前批次内一条序列的数据
         if not varlen:
-            q_b, k_b, v_b, g_slc_b, g_swa_b, i_b = q[i], k[i], v[i], g_slc[i], g_swa[i], block_indices[i]
+            q_b, k_b, v_b, g_slc_b, g_swa_b, i_b = (
+                q[i],
+                k[i],
+                v[i],
+                g_slc[i],
+                g_swa[i],
+                block_indices[i],
+            )
             if isinstance(block_counts, torch.Tensor):
                 s_b = block_counts[i]
             else:
                 s_b = block_counts
         else:
-            T = cu_seqlens[i+1] - cu_seqlens[i]
+            T = cu_seqlens[i + 1] - cu_seqlens[i]
             q_b, k_b, v_b, g_slc_b, g_swa_b, i_b = map(
-                lambda x: x[0][cu_seqlens[i]:cu_seqlens[i+1]],
-                (q, k, v, g_slc, g_swa, block_indices)
+                lambda x: x[0][cu_seqlens[i] : cu_seqlens[i + 1]],
+                (q, k, v, g_slc, g_swa, block_indices),
             )
             if isinstance(block_counts, torch.Tensor):
-                s_b = block_counts[0][cu_seqlens[i]:cu_seqlens[i+1]]
+                s_b = block_counts[0][cu_seqlens[i] : cu_seqlens[i + 1]]
             else:
                 s_b = block_counts
 
+        # 将块索引转换为token索引，[T, Nb] -> [T, Nb, block_size]
         i_b = i_b.unsqueeze(-1) * BS + i_b.new_tensor(range(BS))
         # [T, S*BS, HQ]
         i_b = i_b.view(T, block_indices.shape[2], -1).transpose(1, 2)
+
+        # 逐token计算注意力
         for i_q in range(T):
             # [HQ, D]
-            q_i = q_b[i_q] * scale
+            q_i = q_b[i_q] * scale  # 当前位置的query向量
             # [HQ]
-            g_slc_i = g_slc_b[i_q]
+            g_slc_i = g_slc_b[i_q]  # 当前位置的选择注意力的gate值
             # [HQ]
-            g_swa_i = g_swa_b[i_q]
+            g_swa_i = g_swa_b[i_q]  # 当前位置的滑动窗口注意力的gate值
             # [S*BS, HQ]
-            i_i = i_b[i_q]
+            i_i = i_b[i_q]  # 当前位置应关注的token索引集合
+
+            # 计算当前token可注意的kv-block个数
             # [HQ]
             if isinstance(block_counts, torch.Tensor):
                 s_i = s_b[i_q]
             else:
                 s_i = s_b
-            # [S*BS, HQ, -1]
-            k_i_slc, v_i_slc = map(lambda x: x.gather(0, i_i.clamp(
-                0, T-1).unsqueeze(-1).expand(*i_i.shape, x.shape[-1])), (k_b, v_b))
-            # [S*BS, HQ]
-            attn_slc = torch.einsum('h d, n h d -> n h', q_i, k_i_slc).masked_fill(
-                torch.logical_or(i_i < 0, i_i > i_q) | (c >= s_i if block_counts is not None else False),
-                float('-inf')
-            ).softmax(0)
-            if not varlen:
-                o_slc[i, i_q] = torch.einsum('n h, n h v -> h v', attn_slc, v_i_slc) * g_slc_i.unsqueeze(-1)
-            else:
-                o_slc[0][cu_seqlens[i]+i_q] = torch.einsum('n h, n h v -> h v', attn_slc, v_i_slc) * g_slc_i.unsqueeze(-1)
-            if window_size > 0:
-                k_i_swa, v_i_swa = map(lambda x: x[max(0, i_q - window_size + 1):i_q + 1], (k_b, v_b))
-                attn_swa = torch.einsum('h d, n h d -> n h', q_i, k_i_swa).softmax(0)
-                if not varlen:
-                    o_swa[i, i_q] = torch.einsum('n h, n h v -> h v', attn_swa, v_i_swa) * g_swa_i.unsqueeze(-1)
-                else:
-                    o_swa[0][cu_seqlens[i]+i_q] = torch.einsum('n h, n h v -> h v', attn_swa, v_i_swa) * g_swa_i.unsqueeze(-1)
 
+            # 选择性注意力计算
+            # 根据索引获取相应的键值对
+            # [S*BS, HQ, -1]
+            k_i_slc, v_i_slc = map(
+                lambda x: x.gather(
+                    0, i_i.clamp(0, T - 1).unsqueeze(-1).expand(*i_i.shape, x.shape[-1])
+                ),
+                (k_b, v_b),
+            )
+
+            # 计算注意力分数，应用掩码和softmax
+            # [S*BS, HQ]
+            attn_slc = (
+                torch.einsum("h d, n h d -> n h", q_i, k_i_slc)
+                .masked_fill(
+                    torch.logical_or(i_i < 0, i_i > i_q)
+                    | (c >= s_i if block_counts is not None else False),
+                    float("-inf"),
+                )
+                .softmax(0)
+            )
+
+            # 计算选择性注意力输出
+            if not varlen:
+                o_slc[i, i_q] = torch.einsum(
+                    "n h, n h v -> h v", attn_slc, v_i_slc
+                ) * g_slc_i.unsqueeze(-1)
+            else:
+                o_slc[0][cu_seqlens[i] + i_q] = torch.einsum(
+                    "n h, n h v -> h v", attn_slc, v_i_slc
+                ) * g_slc_i.unsqueeze(-1)
+
+            # 滑动窗口注意力计算（如果启用）
+            if window_size > 0:
+                k_i_swa, v_i_swa = map(
+                    lambda x: x[max(0, i_q - window_size + 1) : i_q + 1], (k_b, v_b)
+                )
+                attn_swa = torch.einsum("h d, n h d -> n h", q_i, k_i_swa).softmax(0)
+                if not varlen:
+                    o_swa[i, i_q] = torch.einsum(
+                        "n h, n h v -> h v", attn_swa, v_i_swa
+                    ) * g_swa_i.unsqueeze(-1)
+                else:
+                    o_swa[0][cu_seqlens[i] + i_q] = torch.einsum(
+                        "n h, n h v -> h v", attn_swa, v_i_swa
+                    ) * g_swa_i.unsqueeze(-1)
+
+    # 恢复head_first格式（如果需要）并返回结果
     if head_first:
-        o_slc = rearrange(o_slc, 'b t h d -> b h t d')
-        o_swa = rearrange(o_swa, 'b t h d -> b h t d')
+        o_slc = rearrange(o_slc, "b t h d -> b h t d")
+        o_swa = rearrange(o_swa, "b t h d -> b h t d")
 
     return o_slc.to(dtype) + o_swa.to(dtype) if o_swa is not None else o_slc.to(dtype)
 
 
 def naive_nsa_compression(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g_cmp: torch.Tensor,
-    block_counts: Union[torch.LongTensor, int],
+    q: torch.Tensor,  # 查询特征
+    k: torch.Tensor,  # 键特征
+    v: torch.Tensor,  # 值特征
+    g_cmp: torch.Tensor,  # 权重
+    block_counts: Union[torch.LongTensor, int],  # 每个token允许attend的block 数目
     block_size: int,
-    scale: float,
-    head_first: bool = False
-) -> torch.LongTensor:
+    scale: float,  # 缩放因子
+    head_first: bool = False,
+) -> (
+    torch.LongTensor
+):  # 输出每个block的压缩表示以及 topk block 的索引，用于后续的选择注意力
+    # 1. 初始化和维度处理
     dtype = q.dtype
-    B, T = q.shape[0], q.shape[1]
-    H, HQ = k.shape[2], q.shape[2]
-    G = HQ//H
+    B, T = q.shape[0], q.shape[1]  # batch size和序列长度
+    H, HQ = k.shape[2], q.shape[2]  # H是k的头数，HQ是q的头数，GQA中 HQ大于等于 H
+    G = HQ // H  # 每个 Group 内部，k 头对应的q 头数量
     BS = block_size
+
+    # 如果block_counts 是整数，扩展为张量
     if isinstance(block_counts, int):
-        block_counts = torch.full((B, T, H), block_counts, dtype=torch.long, device=q.device)
-    q, k, v = map(lambda x: x.float(), (q, k, v))
-    k_cmp, v_cmp = compression(k, v, BS)
-    C = k_cmp.shape[1]
-    S = min(block_counts.max().item(), C)
-    k_cmp, v_cmp = map(lambda x: repeat(x, 'b c h d -> b c (h g) d', g=G), (k_cmp, v_cmp))
+        block_counts = torch.full(
+            (B, T, H), block_counts, dtype=torch.long, device=q.device
+        )
 
-    casual_mask = ((torch.arange(T) - BS + 1)[:, None] // BS < torch.arange(C)[None, :]).to(q.device)
+    # 2. 压缩处理
+    q, k, v = map(lambda x: x.float(), (q, k, v))  # 置换为 float
+    k_cmp, v_cmp = compression(k, v, BS)  # 对 k,v 进行压缩
+    C = k_cmp.shape[1]  # 压缩后的长度
+    S = min(block_counts.max().item(), C)  # 实际选择的块数
+    # 重复k_cmp和v_cmp 以匹配 q的头数
+    k_cmp, v_cmp = map(
+        lambda x: repeat(x, "b c h d -> b c (h g) d", g=G), (k_cmp, v_cmp)
+    )
+
+    # 3. 生成掩码
+    # 因果掩码：确保当前 token 只能看到当前及之前的块的特征
+    casual_mask = (
+        (torch.arange(T) - BS + 1)[:, None] // BS < torch.arange(C)[None, :]
+    ).to(q.device)
     empty_mask = casual_mask.all(-1, True)
-    local_mask = (torch.arange(T)[:, None] // BS == torch.arange(C)[None, :]).to(q.device)
+    # 局部掩码：标识属于当前 token 所在块(local_block)的位置
+    local_mask = (torch.arange(T)[:, None] // BS == torch.arange(C)[None, :]).to(
+        q.device
+    )
 
-    attn_cmp = torch.einsum('bqhd,bkhd->bhqk', q*scale, k_cmp)
-    attn_cmp = attn_cmp.masked_fill(casual_mask & empty_mask.logical_not(), float('-inf'))
-    attn_cmp = attn_cmp.softmax(-1).masked_fill(empty_mask, 0.0)
-    o_cmp = torch.einsum('bhqk, bkhd -> bqhd', attn_cmp, v_cmp) * g_cmp.unsqueeze(-1)
-    attn_select = attn_cmp.masked_fill(local_mask, float(1.0))
-    attn_select = attn_select.view(B, H, G, T, C).sum(2)
-    block_indices = attn_select.topk(S, -1)[1]
+    # 4. 计算注意力
+    # 计算压缩注意力分数并应用因果掩码
+    attn_cmp = torch.einsum("bqhd,bkhd->bhqk", q * scale, k_cmp)  # (B, H, T, C)
+    attn_cmp = attn_cmp.masked_fill(
+        casual_mask & empty_mask.logical_not(), float("-inf")
+    )  # 将未来信息 mask 掉
+    attn_cmp = attn_cmp.softmax(-1).masked_fill(
+        empty_mask, 0.0
+    )  # 对最后一维进行 softmax
 
-    block_indices = block_indices.masked_fill(block_indices > (block_indices.new_tensor(range(T))[:, None] // BS), -1)
-    block_indices = block_indices.transpose(1, 2)
+    # 计算输出并应用 gate
+    o_cmp = torch.einsum("bhqk, bkhd -> bqhd", attn_cmp, v_cmp) * g_cmp.unsqueeze(
+        -1
+    )  # (B, T, H, D), 应用 gate
 
+    # 5. 选择重要的块
+    # 准备块选择的注意力分数
+    attn_select = attn_cmp.masked_fill(local_mask, float(1.0))  # 确保选择当前块
+    attn_select = attn_select.view(B, H, G, T, C).sum(2)  # (B, H, T, C)
+
+    # 选择 top-k 块并进行有效性过滤
+    block_indices = attn_select.topk(S, -1)[1]  # 选择最重要的 S 个块
+    # 二次确保选择的索引正确
+    block_indices = block_indices.masked_fill(
+        block_indices > (block_indices.new_tensor(range(T))[:, None] // BS), -1
+    )
+    block_indices = block_indices.transpose(1, 2)  # (B, T, H, S)
+
+    # 6. 调整输出格式
     if head_first:
-        o_cmp = rearrange(o_cmp, 'b t h d -> b h t d')
+        o_cmp = rearrange(o_cmp, "b t h d -> b h t d")
     return block_indices, o_cmp.to(dtype)
 
 
@@ -221,29 +321,33 @@ def naive_nsa_compression_varlen(
     block_counts: Union[torch.LongTensor, int],
     block_size: int,
     scale: float,
-    cu_seqlens: torch.LongTensor,
-    head_first: bool = False
+    cu_seqlens: torch.LongTensor,  # 新增累积序列长度
+    head_first: bool = False,
 ) -> torch.LongTensor:
     dtype = q.dtype
     B, T = q.shape[0], q.shape[1]
     H, HQ = k.shape[2], q.shape[2]
     D = v.shape[-1]
-    G = HQ//H
+    G = HQ // H
     BS = block_size
     S = block_counts if isinstance(block_counts, int) else block_counts.max().item()
     C = math.ceil(T / block_size)
     S = min(S, C)
+
+    # 初始化全局输出
     block_indices = torch.zeros(B, T, H, S, dtype=torch.long, device=q.device)
     o_cmp = torch.zeros(B, T, HQ, D, dtype=dtype, device=q.device)
+
+    # 新增循环处理每个序列
     for i in range(len(cu_seqlens) - 1):
-        T_b = cu_seqlens[i+1] - cu_seqlens[i]
+        # 获取当前序列切片
+        T_b = cu_seqlens[i + 1] - cu_seqlens[i]
         C_b = math.ceil(T_b / block_size)
         q_b, k_b, v_b, g_cmp_b = map(
-            lambda x: x[0][cu_seqlens[i]:cu_seqlens[i+1]],
-            (q, k, v, g_cmp)
+            lambda x: x[0][cu_seqlens[i] : cu_seqlens[i + 1]], (q, k, v, g_cmp)
         )
         if isinstance(block_counts, torch.Tensor):
-            s_b = block_counts[0][cu_seqlens[i]:cu_seqlens[i+1]]
+            s_b = block_counts[0][cu_seqlens[i] : cu_seqlens[i + 1]]
         else:
             s_b = block_counts
 
@@ -251,44 +355,60 @@ def naive_nsa_compression_varlen(
         S_b = s_b if isinstance(s_b, int) else s_b.max().item()
         C_b = k_cmp.shape[1]
         S_b = min(S_b, C_b)
-        k_cmp, v_cmp = map(lambda x: repeat(x.squeeze(0), 'c h d -> c (h g) d', g=G), (k_cmp, v_cmp))
+        k_cmp, v_cmp = map(
+            lambda x: repeat(x.squeeze(0), "c h d -> c (h g) d", g=G), (k_cmp, v_cmp)
+        )
         q_b, k_cmp, v_cmp = map(lambda x: x.float(), (q_b, k_cmp, v_cmp))
 
-        casual_mask = ((torch.arange(T_b) - BS + 1)[:, None] // BS < torch.arange(C_b)[None, :]).to(q_b.device)
-        local_mask = (torch.arange(T_b)[:, None] // BS == torch.arange(C_b)[None, :]).to(q.device)
+        casual_mask = (
+            (torch.arange(T_b) - BS + 1)[:, None] // BS < torch.arange(C_b)[None, :]
+        ).to(q_b.device)
+        local_mask = (
+            torch.arange(T_b)[:, None] // BS == torch.arange(C_b)[None, :]
+        ).to(q.device)
 
-        attn_cmp = torch.einsum('qhd,khd->hqk', q_b*scale, k_cmp)
-        attn_cmp = attn_cmp.masked_fill(casual_mask, float('-inf'))
+        attn_cmp = torch.einsum("qhd,khd->hqk", q_b * scale, k_cmp)
+        attn_cmp = attn_cmp.masked_fill(casual_mask, float("-inf"))
         attn_cmp = attn_cmp.softmax(-1)
-        o_cmp[0][cu_seqlens[i]:cu_seqlens[i+1]] = torch.einsum('hqk,khd->qhd', attn_cmp, v_cmp).nan_to_num() *\
-            g_cmp_b.unsqueeze(-1)
+        o_cmp[0][cu_seqlens[i] : cu_seqlens[i + 1]] = torch.einsum(
+            "hqk,khd->qhd", attn_cmp, v_cmp
+        ).nan_to_num() * g_cmp_b.unsqueeze(-1)
         attn_select = attn_cmp.masked_fill(local_mask, float(1.0))
         attn_select = attn_select.view(H, G, T_b, C_b).sum(1)
         block_indices_b = attn_select.topk(S_b, -1)[1]
         block_indices_b = block_indices_b.masked_fill(
-            block_indices_b > (block_indices_b.new_tensor(range(T_b))[:, None]//BS),
-            0
+            block_indices_b > (block_indices_b.new_tensor(range(T_b))[:, None] // BS), 0
         )
-        block_indices[0][cu_seqlens[i]:cu_seqlens[i+1], :, :S_b] = block_indices_b.transpose(0, 1)
+        block_indices[0][cu_seqlens[i] : cu_seqlens[i + 1], :, :S_b] = (
+            block_indices_b.transpose(0, 1)
+        )
 
     if head_first:
-        o_cmp = rearrange(o_cmp, 'b t h d -> b h t d')
+        o_cmp = rearrange(o_cmp, "b t h d -> b h t d")
     return block_indices, o_cmp.to(dtype)
 
 
 def naive_nsa_with_compression(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g_cmp: torch.Tensor,
-    g_slc: torch.Tensor,
-    g_swa: torch.Tensor,
-    block_counts: Union[torch.LongTensor, int],
-    block_size: int = 64,
-    window_size: int = 0,
-    scale: Optional[float] = None,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    head_first: bool = False
+    # 解释：
+    # B: 批次大小
+    # T: 序列长度
+    # H: 键/值的注意力头数
+    # HQ: 查询的注意力头数(GQA 中 HQ>=H)
+    # K: 键/查询的隐藏维度
+    # V: 值的隐藏维度
+    # G: 查询头与键/值的比率(G=HQ/H)
+    q: torch.Tensor,  # 查询向量 [B, T, HQ, K] 或 [B, HQ, T, K]
+    k: torch.Tensor,  # 键向量 [B, T, H, K] 或 [B, H, T, K]
+    v: torch.Tensor,  # 值向量 [B, T, H, V] 或 [B, H, T, V]
+    g_cmp: torch.Tensor,  # 压缩注意力的门控分数 [B, T, HQ] 或 [B, HQ, T]
+    g_slc: torch.Tensor,  # 选择注意力的门控分数 [B, T, HQ] 或 [B, HQ, T]
+    g_swa: torch.Tensor,  # 滑动窗口注意力的门控分数 [B, T, HQ] 或 [B, HQ, T]
+    block_counts: Union[torch.LongTensor, int],  # 每个查询选择的块数
+    block_size: int = 64,  # 块大小
+    window_size: int = 0,  # 滑动窗口大小
+    scale: Optional[float] = None,  # 注意力分数的缩放因子
+    cu_seqlens: Optional[torch.LongTensor] = None,  # 用于变长序列
+    head_first: bool = False,  # 指示Head维度是否放在长度维度T之前
 ) -> torch.Tensor:
     r"""
     Args:
@@ -326,17 +446,20 @@ def naive_nsa_with_compression(
         o (torch.Tensor):
             Outputs of shape `[B, T, HQ, V]` if `head_first=False` else `[B, HQ, T, V]`.
     """
+    # 0. 格式处理
     if scale is None:
         scale = k.shape[-1] ** -0.5
     if cu_seqlens is not None:
         assert q.shape[0] == 1, "batch size must be 1 when cu_seqlens are provided"
         if head_first:
-            raise RuntimeError("Sequences with variable lengths are not supported for head-first mode")
+            raise RuntimeError(
+                "Sequences with variable lengths are not supported for head-first mode"
+            )
     if head_first:
-        q, k, v = map(lambda x: rearrange(x, 'b h t d -> b t h d'), (q, k, v))
-        g_cmp, g_slc = map(lambda x: rearrange(x, 'b h t -> b t h'), (g_cmp, g_slc))
+        q, k, v = map(lambda x: rearrange(x, "b h t d -> b t h d"), (q, k, v))
+        g_cmp, g_slc = map(lambda x: rearrange(x, "b h t -> b t h"), (g_cmp, g_slc))
         if isinstance(block_counts, torch.Tensor):
-            block_counts = rearrange(block_counts, 'b h t -> b t h')
+            block_counts = rearrange(block_counts, "b h t -> b t h")
     if cu_seqlens is not None:
         block_indices, o_cmp = naive_nsa_compression_varlen(
             q=q,
@@ -347,8 +470,10 @@ def naive_nsa_with_compression(
             block_size=block_size,
             scale=scale,
             cu_seqlens=cu_seqlens,
-            head_first=False)
+            head_first=False,
+        )
     else:
+        # 1. 计算压缩注意力和块索引
         block_indices, o_cmp = naive_nsa_compression(
             q=q,
             k=k,
@@ -357,23 +482,28 @@ def naive_nsa_with_compression(
             block_counts=block_counts,
             block_size=block_size,
             scale=scale,
-            head_first=False)
-    o = naive_nsa(
-        q=q,
-        k=k,
-        v=v,
-        g_slc=g_slc,
-        g_swa=g_swa,
-        block_indices=block_indices,
-        block_counts=block_counts,
-        block_size=block_size,
-        window_size=window_size,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        head_first=False
-    ) + o_cmp
+            head_first=False,
+        )
+    # 2. 计算选择性注意力和滑动窗口注意力
+    o = (
+        naive_nsa(
+            q=q,
+            k=k,
+            v=v,
+            g_slc=g_slc,
+            g_swa=g_swa,
+            block_indices=block_indices,
+            block_counts=block_counts,
+            block_size=block_size,
+            window_size=window_size,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            head_first=False,
+        )
+        + o_cmp
+    )  # 3. 组合所有输出
 
     if head_first:
-        o = rearrange(o, 'b t h d -> b h t d')
+        o = rearrange(o, "b t h d -> b h t d")
 
     return o, block_indices
